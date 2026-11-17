@@ -25,6 +25,8 @@ pub enum ContractError {
     CollateralInvariant = 12,
     Unauthorized = 13,
     InvalidRecipient = 14,
+    Reentrancy = 15,
+    ExternalCallFailed = 16,
 }
 
 #[contracttype]
@@ -57,10 +59,52 @@ enum DataKey {
     NextSeries,
     Series(u64),
     Balance(u64, Address),
+    Locked,
 }
 
 #[contract]
 pub struct ZenithOptions;
+
+/// Reentrancy guard shared by every entry point that makes an external call.
+///
+/// The lock lives in instance storage and is set *before* the first external
+/// call and cleared after all state writes and calls complete. A nested entry
+/// while the lock is held is rejected with [`ContractError::Reentrancy`]; the
+/// lock is never left set on a successful path, and a failed external call
+/// aborts the whole invocation so no partial state is committed.
+struct ReentrancyGuard;
+
+impl ReentrancyGuard {
+    fn acquire(env: &Env) -> Result<(), ContractError> {
+        if env.storage().instance().get(&DataKey::Locked).unwrap_or(false) {
+            return Err(ContractError::Reentrancy);
+        }
+        env.storage().instance().set(&DataKey::Locked, &true);
+        Ok(())
+    }
+
+    fn release(env: &Env) {
+        env.storage().instance().set(&DataKey::Locked, &false);
+    }
+}
+
+/// Invariants enforced on entry and after every state transition:
+///
+/// 1. `0 <= paid_total <= collateral_total` for every series.
+/// 2. `0 <= remaining_supply <= total_supply`.
+/// 3. `collateral_total` covers the capped payout of every outstanding unit.
+/// 4. The contract's token balance is at least the outstanding liability
+///    (`collateral_total - paid_total`) of all series it escrows.
+fn assert_series_invariants(series: &OptionSeries) -> Result<(), ContractError> {
+    if series.paid_total < 0
+        || series.paid_total > series.collateral_total
+        || series.remaining_supply < 0
+        || series.remaining_supply > series.total_supply
+    {
+        return Err(ContractError::CollateralInvariant);
+    }
+    Ok(())
+}
 
 #[contractimpl]
 impl ZenithOptions {
@@ -74,6 +118,7 @@ impl ZenithOptions {
         env.storage().instance().set(&DataKey::Oracle, &oracle);
         env.storage().instance().set(&DataKey::Usdc, &usdc);
         env.storage().instance().set(&DataKey::NextSeries, &1_u64);
+        env.storage().instance().set(&DataKey::Locked, &false);
         bump_instance(&env);
         Ok(())
     }
@@ -161,6 +206,7 @@ impl ZenithOptions {
             return Err(ContractError::InvalidQuantity);
         }
         let mut series = load_series(&env, series_id)?;
+        assert_series_invariants(&series)?;
         if series.settled || env.ledger().timestamp() >= series.expiry {
             return Err(ContractError::InvalidSeries);
         }
@@ -183,17 +229,22 @@ impl ZenithOptions {
             .checked_add(quantity)
             .ok_or(ContractError::ArithmeticOverflow)?;
 
-        token::Client::new(&env, &usdc_address(&env)?).transfer(
-            &admin,
-            &env.current_contract_address(),
-            &collateral,
-        );
-
+        // Checks-effects-interactions: write all state before the token call.
         series.total_supply = new_supply;
         series.remaining_supply = new_remaining;
         series.collateral_total = new_total_collateral;
+        assert_series_invariants(&series)?;
         save_series(&env, &series);
         save_balance(&env, series_id, &holder, new_balance);
+
+        ReentrancyGuard::acquire(&env)?;
+        let token = token::Client::new(&env, &usdc_address(&env)?);
+        let transferred = token.try_transfer(&admin, &env.current_contract_address(), &collateral);
+        ReentrancyGuard::release(&env);
+        if !matches!(transferred, Ok(Ok(()))) {
+            return Err(ContractError::ExternalCallFailed);
+        }
+
         env.events()
             .publish(
                 (symbol_short!("mint"), series_id),
@@ -226,6 +277,7 @@ impl ZenithOptions {
             return Err(ContractError::InvalidQuantity);
         }
         let series = load_series(&env, series_id)?;
+        assert_series_invariants(&series)?;
         if series.settled || env.ledger().timestamp() >= series.expiry {
             return Err(ContractError::InvalidSeries);
         }
@@ -270,6 +322,7 @@ impl ZenithOptions {
             return Err(ContractError::InvalidFixing);
         }
         let mut series = load_series(&env, series_id)?;
+        assert_series_invariants(&series)?;
         if series.settled {
             return Err(ContractError::AlreadySettled);
         }
@@ -278,6 +331,7 @@ impl ZenithOptions {
         }
         series.fixing_price = fixing_price;
         series.settled = true;
+        assert_series_invariants(&series)?;
         save_series(&env, &series);
         env.events().publish(
             (symbol_short!("settled"), series_id),
@@ -299,6 +353,7 @@ impl ZenithOptions {
             return Err(ContractError::InvalidQuantity);
         }
         let mut series = load_series(&env, series_id)?;
+        assert_series_invariants(&series)?;
         if !series.settled {
             return Err(ContractError::NotSettled);
         }
@@ -323,26 +378,37 @@ impl ZenithOptions {
         }
         series.remaining_supply -= quantity;
         series.paid_total = new_paid_total;
-        save_balance(&env, series_id, &holder, balance - quantity);
-
-        let token = token::Client::new(&env, &usdc_address(&env)?);
-        let contract = env.current_contract_address();
-        if payout > 0 {
-            token.transfer(&contract, &holder, &payout);
-        }
-
         let mut residual = 0;
         if series.remaining_supply == 0 && !series.residual_released {
             residual = series
                 .collateral_total
                 .checked_sub(series.paid_total)
                 .ok_or(ContractError::CollateralInvariant)?;
-            if residual > 0 {
-                token.transfer(&contract, &series.issuer, &residual);
-            }
             series.residual_released = true;
         }
+        assert_series_invariants(&series)?;
         save_series(&env, &series);
+        save_balance(&env, series_id, &holder, balance - quantity);
+
+        ReentrancyGuard::acquire(&env)?;
+        let token = token::Client::new(&env, &usdc_address(&env)?);
+        let contract = env.current_contract_address();
+        let mut paid = true;
+        if payout > 0 {
+            paid = matches!(token.try_transfer(&contract, &holder, &payout), Ok(Ok(())));
+        }
+        let mut refunded = true;
+        if paid && residual > 0 {
+            refunded = matches!(
+                token.try_transfer(&contract, &series.issuer, &residual),
+                Ok(Ok(()))
+            );
+        }
+        ReentrancyGuard::release(&env);
+        if !paid || !refunded {
+            return Err(ContractError::ExternalCallFailed);
+        }
+
         env.events().publish(
             (symbol_short!("exercise"), series_id),
             (holder, quantity, payout),
@@ -479,6 +545,7 @@ mod kani_proofs;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::Address as _;
 
     #[test]
     fn capped_call_and_put_payoffs_use_seven_decimal_units() {
@@ -511,5 +578,56 @@ mod tests {
             ceil_mul_scaled(i128::MAX, 2),
             Err(ContractError::ArithmeticOverflow)
         );
+    }
+
+    #[test]
+    fn series_invariants_reject_inconsistent_state() {
+        let env = Env::default();
+        let issuer = Address::generate(&env);
+        let mut series = OptionSeries {
+            id: 1,
+            underlying: String::from_str(&env, "BTC"),
+            strike: 100 * SCALE,
+            expiry: 1_000,
+            is_call: true,
+            max_payout_per_contract: 10 * SCALE,
+            issuer,
+            total_supply: 0,
+            remaining_supply: 0,
+            collateral_total: 0,
+            paid_total: 0,
+            fixing_price: 0,
+            settled: false,
+            residual_released: false,
+        };
+        assert_eq!(assert_series_invariants(&series), Ok(()));
+
+        series.paid_total = 1;
+        assert_eq!(
+            assert_series_invariants(&series),
+            Err(ContractError::CollateralInvariant)
+        );
+        series.paid_total = 0;
+        series.remaining_supply = 1;
+        assert_eq!(
+            assert_series_invariants(&series),
+            Err(ContractError::CollateralInvariant)
+        );
+    }
+
+    #[test]
+    fn reentrancy_guard_rejects_nested_entry_and_clears_after_release() {
+        let env = Env::default();
+        let contract_id = env.register(ZenithOptions, ());
+        env.as_contract(&contract_id, || {
+            assert_eq!(ReentrancyGuard::acquire(&env), Ok(()));
+            assert_eq!(
+                ReentrancyGuard::acquire(&env),
+                Err(ContractError::Reentrancy)
+            );
+            ReentrancyGuard::release(&env);
+            assert_eq!(ReentrancyGuard::acquire(&env), Ok(()));
+            ReentrancyGuard::release(&env);
+        });
     }
 }

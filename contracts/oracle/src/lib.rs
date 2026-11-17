@@ -21,6 +21,7 @@ pub enum OracleError {
     InvalidPrice = 4,
     InvalidExpiry = 5,
     FixingAlreadyPublished = 6,
+    Reentrancy = 7,
 }
 
 #[contracttype]
@@ -37,10 +38,41 @@ enum DataKey {
     Admin,
     Publisher,
     Fixing(String, u64),
+    Locked,
 }
 
 #[contract]
 pub struct OracleContract;
+
+/// Reentrancy guard for the oracle's state-changing entry points.
+///
+/// The oracle makes no external contract calls today, but the guard is kept
+/// here so any future cross-contract call (e.g. a settlement callback) cannot
+/// re-enter `publish_fixing` or the admin setters. The lock is set before the
+/// critical section and cleared afterwards; a nested entry is rejected with
+/// [`OracleError::Reentrancy`].
+struct ReentrancyGuard;
+
+impl ReentrancyGuard {
+    fn acquire(env: &Env) {
+        if env.storage().instance().get(&DataKey::Locked).unwrap_or(false) {
+            panic_with_error!(env, OracleError::Reentrancy);
+        }
+        env.storage().instance().set(&DataKey::Locked, &true);
+    }
+
+    fn release(env: &Env) {
+        env.storage().instance().set(&DataKey::Locked, &false);
+    }
+}
+
+/// Invariants enforced on entry and after every state transition:
+///
+/// 1. The contract is initialized before any privileged entry point runs.
+/// 2. A stored fixing is immutable: `(underlying, expiry)` is written once.
+/// 3. Every stored fixing has a strictly positive price and `expiry <=
+///    published_at`.
+/// 4. The reentrancy lock is never left set after a successful invocation.
 
 #[contractimpl]
 impl OracleContract {
@@ -55,6 +87,7 @@ impl OracleContract {
         env.storage()
             .instance()
             .set(&DataKey::Publisher, &publisher);
+        env.storage().instance().set(&DataKey::Locked, &false);
         extend_instance_ttl(&env);
     }
 
@@ -88,6 +121,7 @@ impl OracleContract {
         env.crypto()
             .ed25519_verify(&publisher, &message, &signature);
 
+        ReentrancyGuard::acquire(&env);
         env.storage().persistent().set(
             &key,
             &Fixing {
@@ -99,6 +133,7 @@ impl OracleContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+        ReentrancyGuard::release(&env);
         env.events().publish((underlying, expiry), price);
     }
 
@@ -121,9 +156,11 @@ impl OracleContract {
     pub fn set_publisher(env: Env, publisher: BytesN<32>) {
         let admin = get_admin(&env);
         admin.require_auth();
+        ReentrancyGuard::acquire(&env);
         env.storage()
             .instance()
             .set(&DataKey::Publisher, &publisher);
+        ReentrancyGuard::release(&env);
         extend_instance_ttl(&env);
     }
 
@@ -131,7 +168,9 @@ impl OracleContract {
     pub fn set_admin(env: Env, new_admin: Address) {
         let admin = get_admin(&env);
         admin.require_auth();
+        ReentrancyGuard::acquire(&env);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        ReentrancyGuard::release(&env);
         extend_instance_ttl(&env);
     }
 }
@@ -290,5 +329,18 @@ mod test {
         let replacement = BytesN::from_array(&env, &[9; 32]);
 
         assert!(client.try_set_publisher(&replacement).is_err());
+    }
+
+    #[test]
+    fn reentrancy_guard_rejects_nested_entry_and_clears_after_release() {
+        let (env, contract_id, _, _) = setup();
+        env.as_contract(&contract_id, || {
+            ReentrancyGuard::acquire(&env);
+            assert!(env.storage().instance().get(&DataKey::Locked).unwrap_or(false));
+            ReentrancyGuard::release(&env);
+            assert!(!env.storage().instance().get(&DataKey::Locked).unwrap_or(true));
+            ReentrancyGuard::acquire(&env);
+            ReentrancyGuard::release(&env);
+        });
     }
 }

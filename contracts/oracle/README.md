@@ -13,6 +13,17 @@ emits an event on publication. Persistent entries are extended for up to
 30 days on publish and read; deployments must account for Soroban storage TTL
 and archival when designing long-term settlement history.
 
+## Reentrancy and external-call safety
+
+State-changing entry points (`publish_fixing`, `set_publisher`, `set_admin`)
+take a reentrancy lock in instance storage around their critical section; a
+nested entry fails with `OracleError::Reentrancy`. The oracle makes no external
+contract calls today, so the guard exists to keep any future cross-contract
+callback from re-entering. Invariants: the contract is initialized before any
+privileged entry point, a fixing is written once per `(underlying, expiry)`,
+every stored fixing has a positive price with `expiry <= published_at`, and the
+lock is never left set after a successful invocation.
+
 This crate does not connect to the backend publisher, choose or aggregate
 market-data sources, or provide a production deployment configuration. The
 single publisher key and five-minute policy are explicit trust assumptions,

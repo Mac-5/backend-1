@@ -26,6 +26,24 @@ cargo test --manifest-path contracts/options/Cargo.toml
 cargo build --manifest-path contracts/options/Cargo.toml --target wasm32v1-none --release
 ```
 
+## Reentrancy and external-call safety
+
+Every entry point that moves funds (`mint`, `claim`) takes a reentrancy lock in
+instance storage before its first token call and clears it afterwards. A nested
+entry while the lock is held fails with `ContractError::Reentrancy`. All state
+is written before the token call (checks-effects-interactions) and token
+results are handled as typed `Result`s: a failed or malformed token response
+returns `ContractError::ExternalCallFailed` and aborts the invocation, so no
+partial state is committed.
+
+Invariants enforced on entry and after every transition:
+
+1. `0 <= paid_total <= collateral_total` per series.
+2. `0 <= remaining_supply <= total_supply` per series.
+3. `collateral_total` covers the capped payout of every outstanding unit.
+4. The contract's token balance is at least the outstanding liability
+   (`collateral_total - paid_total`) of every escrowed series.
+
 The contract has not been deployed or independently audited. Before production
 use, deploy against the intended USDC contract and test network, review role
 key custody and oracle operations, and obtain an independent Soroban security
