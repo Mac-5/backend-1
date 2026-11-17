@@ -432,7 +432,10 @@ fn bump_instance(env: &Env) {
         .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
-fn ceil_mul_scaled(price: i128, quantity: i128) -> Result<i128, ContractError> {
+/// Collateral deposited for `quantity` units at `price`, rounded up to the
+/// token's 7-decimal unit. Pure, so the Kani harnesses in `kani_proofs.rs` can
+/// verify it without an `Env`.
+pub(crate) fn ceil_mul_scaled(price: i128, quantity: i128) -> Result<i128, ContractError> {
     if price <= 0 || quantity <= 0 {
         return Err(ContractError::InvalidQuantity);
     }
@@ -445,7 +448,9 @@ fn ceil_mul_scaled(price: i128, quantity: i128) -> Result<i128, ContractError> {
         .map(|rounded| rounded / SCALE)
 }
 
-fn settlement_payout(
+/// Capped intrinsic payout for `quantity` units. Pure, so the Kani harnesses in
+/// `kani_proofs.rs` can verify it without an `Env`.
+pub(crate) fn settlement_payout(
     is_call: bool,
     strike: i128,
     fixing_price: i128,
@@ -467,6 +472,9 @@ fn settlement_payout(
         .ok_or(ContractError::ArithmeticOverflow)
         .map(|amount| amount / SCALE)
 }
+
+#[cfg(kani)]
+mod kani_proofs;
 
 #[cfg(test)]
 mod tests {
